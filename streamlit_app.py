@@ -15,7 +15,7 @@ import plotly.express as px
 import streamlit as st
 from streamlit.errors import StreamlitSecretNotFoundError
 from docx import Document
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_COLOR_INDEX
 from docx.shared import Inches, Pt, RGBColor
 
 st.set_page_config(page_title="Ruang Anggaran — Dashboard RAB & TOR",page_icon="balmon.png", layout="wide")
@@ -92,6 +92,23 @@ def split_text_rows(text):
         delimiter = "\t" if "\t" in line else re.compile(r" {2,}")
         rows.append([part.strip() or None for part in delimiter.split(line.strip())])
     return trim_rows(rows)
+
+
+def parse_rtf_rows(content):
+    text = content.decode("cp1252", errors="replace")
+    text = re.sub(
+        r"\\'([0-9a-fA-F]{2})",
+        lambda match: bytes.fromhex(match.group(1)).decode("cp1252"),
+        text,
+    )
+    text = re.sub(r"\\u(-?\d+)\??", lambda match: chr(int(match.group(1)) % 65536), text)
+    text = re.sub(r"\\(?:par[d]?|row|line)\b ?", "\n", text)
+    text = re.sub(r"\\(?:cell|tab)\b ?", "\t", text)
+    text = re.sub(r"\\~", " ", text)
+    text = re.sub(r"\\([\\{}])", r"\1", text)
+    text = re.sub(r"\\[a-zA-Z]+-?\d* ?", "", text)
+    text = text.replace("{", "").replace("}", "")
+    return split_text_rows(text)
 
 
 def parse_sp2d_rows(rows):
@@ -439,9 +456,14 @@ def parse_upload(name, content):
         for table in doc.tables:
             rows.extend([[cell.text.strip() or None for cell in row.cells] for row in table.rows])
             rows.append([])
-        if not rows:
-            rows = split_text_rows("\n".join(paragraph.text for paragraph in doc.paragraphs))
+        paragraph_rows = split_text_rows("\n".join(paragraph.text for paragraph in doc.paragraphs))
+        rows.extend(paragraph_rows)
         return {"Data RAB": trim_rows(rows)}
+    if extension == ".rtf":
+        rows = parse_rtf_rows(content)
+        if not rows:
+            raise ValueError("Dokumen RTF tidak memiliki teks yang dapat dibaca.")
+        return {"Data RAB": rows}
     if extension == ".pdf":
         try:
             import pdfplumber
@@ -834,6 +856,150 @@ def analyze_rows(rows, sheet_name):
     }
 
 
+def analyze_combined_tables(tables):
+    analyses = [(name, analyze_rows(rows, name)) for name, rows in tables]
+    valid = [(name, analysis) for name, analysis in analyses if analysis.get("header_found")]
+    combined_rows = []
+    row_indexes = {}
+    duplicate_sources = {}
+    conflicts = {}
+
+    for source, analysis in valid:
+        for source_row in analysis["rows"]:
+            row = dict(source_row)
+            row.pop("_raw", None)
+            row["Sumber"] = source
+            amount_values = tuple(
+                row.get(key)
+                for key in ("Pagu", "Pagu Penuh", "Pagu Efektif", "Pagu Terblokir", "Realisasi", "Sisa anggaran")
+            )
+            code = clean_text(row.get("Kode")).upper()
+            description = clean_text(row.get("Uraian")).casefold()
+            identity = (
+                code, description, amount_values
+            ) if code else (source, description, amount_values)
+            group_identity = (code, description) if code else None
+
+            if group_identity:
+                conflicts.setdefault(group_identity, set()).add(row.get("Pagu"))
+            if identity in row_indexes:
+                existing = combined_rows[row_indexes[identity]]
+                duplicate_sources.setdefault(identity, set()).add(existing["Sumber"])
+                duplicate_sources[identity].add(source)
+                continue
+            row_indexes[identity] = len(combined_rows)
+            combined_rows.append(row)
+
+    for identity, sources in duplicate_sources.items():
+        combined_rows[row_indexes[identity]]["Sumber"] = ", ".join(sorted(sources))
+
+    conflict_groups = [
+        identity for identity, values in conflicts.items()
+        if len([value for value in values if value is not None]) > 1
+    ]
+
+    category_indexes = {}
+    categories = []
+    for source, analysis in valid:
+        for source_category in analysis.get("categories", []):
+            category = dict(source_category)
+            category["Sumber"] = source
+            identity = (
+                clean_text(category.get("Kode")).upper(),
+                clean_text(category.get("Kategori")).casefold(),
+                category.get("Pagu"),
+                category.get("Sisa"),
+            )
+            if identity in category_indexes:
+                existing = categories[category_indexes[identity]]
+                if source not in existing["Sumber"].split(", "):
+                    existing["Sumber"] += ", " + source
+                continue
+            category_indexes[identity] = len(categories)
+            categories.append(category)
+    categories.sort(key=lambda row: row["Pagu"] or 0, reverse=True)
+
+    revisions = [
+        (source, analysis["revision"])
+        for source, analysis in valid if analysis.get("revision")
+    ]
+    revision = None
+    if revisions:
+        changes = []
+        for source, source_revision in revisions:
+            for change in source_revision["changes"]:
+                changes.append(dict(change, Sumber=source))
+        increases = [row for row in changes if row["Selisih"] > 0]
+        insufficient = [row for row in increases if row["_status"] == "short"]
+        revision = {
+            "changes": changes,
+            "increases": increases,
+            "decreases": [row for row in changes if row["Selisih"] < 0],
+            "increase_total": sum(row["Selisih"] for row in increases),
+            "decrease_total": sum(abs(row["Selisih"]) for row in changes if row["Selisih"] < 0),
+            "sufficient_count": sum(row["_status"] == "enough" for row in increases),
+            "insufficient_count": len(insufficient),
+            "unknown_count": sum(row["_status"] == "unknown" for row in increases),
+            "shortfall": sum(row["Selisih"] - row["Sisa anggaran"] for row in insufficient),
+        }
+
+    insights = []
+    for source, analysis in valid:
+        insights.extend("{}: {}".format(source, insight) for insight in analysis.get("insights", []))
+    if conflict_groups:
+        insights.append(
+            "{} kode dan uraian memiliki nilai pagu berbeda antar sumber; tinjau baris bertanda sumber sebelum menjumlahkannya.".format(
+                len(conflict_groups)
+            )
+        )
+    if duplicate_sources:
+        insights.append(
+            "{} baris yang identik dari beberapa file disatukan agar tidak dihitung berulang.".format(
+                len(duplicate_sources)
+            )
+        )
+    if len(valid) > 1 and combined_rows:
+        insights.append(
+            "Analisis gabungan memuat {} baris bernilai dari {} tabel/file; kolom Sumber menunjukkan asal datanya.".format(
+                len(combined_rows), len(valid)
+            )
+        )
+
+    comparisons = [
+        analysis.get("budget_comparison")
+        for _, analysis in valid if analysis.get("budget_comparison")
+    ]
+    comparison = comparisons[0] if len(comparisons) == 1 else None
+    total_pagu = sum(row["Pagu"] for row in categories if row.get("Pagu") is not None)
+    remaining_values = [row["Sisa"] for row in categories if row.get("Sisa") is not None]
+    sources = list(dict.fromkeys(name for name, _ in valid))
+    return {
+        "sheet": "Gabungan semua file",
+        "header_found": bool(valid),
+        "revision": revision,
+        "rows": combined_rows,
+        "ranked": sorted(
+            combined_rows,
+            key=lambda row: row.get("Pagu") or 0,
+            reverse=True,
+        )[:5],
+        "categories": categories,
+        "columns": [],
+        "money_col": -1,
+        "remaining_col": -1,
+        "pagu_total": total_pagu or None,
+        "remaining_total": sum(remaining_values) if remaining_values else None,
+        "category_total": total_pagu,
+        "category_remaining_total": sum(remaining_values) if remaining_values else None,
+        "grouping": "gabungan lintas sumber",
+        "source_count": sum(analysis.get("source_count", 0) for _, analysis in valid),
+        "excluded_count": sum(analysis.get("excluded_count", 0) for _, analysis in analyses),
+        "sources": sources,
+        "insights": insights[:12],
+        "budget_comparison": comparison,
+    }
+
+
 def format_rupiah(value):
     if value is None:
         return "—"
@@ -1061,8 +1227,8 @@ def render_auth():
 def load_analysis():
     uploads = st.file_uploader(
         "Unggah file anggaran",
-        type=["xlsx", "xls", "xlsm", "csv", "docx", "pdf"],
-        help="Untuk perbandingan anggaran lengkap, pilih kedua PDF: Rincian Kertas Kerja Satker dan Laporan FA Detail. Maksimum 20 MB per file; PDF hasil pindai perlu OCR.",
+        type=["xlsx", "xls", "xlsm", "csv", "docx", "rtf", "pdf"],
+        help="Pilih satu atau beberapa file Excel, CSV, Word .docx/.rtf, atau PDF berbasis teks. Beberapa file akan dianalisis bersama dan tetap tersedia per sumber. Maksimum 20 MB per file; PDF hasil pindai perlu OCR.",
         accept_multiple_files=True,
     )
     if uploads:
@@ -1079,7 +1245,7 @@ def load_analysis():
                     for filename, content in file_contents
                 ]
                 special_documents = []
-                other_files = []
+                source_tables = []
                 for filename, sheets in parsed_files:
                     special_sheets = [
                         (sheet_name, rows)
@@ -1087,37 +1253,47 @@ def load_analysis():
                         if sheet_name in ("Rincian Kertas Kerja", "Laporan FA Detail")
                     ]
                     if special_sheets:
-                        if len(special_sheets) != 1:
-                            raise ValueError("Unggah satu file Rincian Kertas Kerja dan satu Laporan FA Detail.")
                         special_documents.extend(special_sheets)
                     else:
-                        other_files.append((filename, sheets))
+                        for sheet_name, rows in sheets.items():
+                            label = "{} — {}".format(Path(filename).stem, sheet_name)
+                            source_tables.append((label, rows))
                 if special_documents:
-                    if other_files:
-                        raise ValueError("File Rincian Kertas Kerja dan Laporan FA hanya dapat digabung dengan kedua format tersebut.")
                     if len(special_documents) > 2:
                         raise ValueError("Unggah maksimal satu Rincian Kertas Kerja dan satu Laporan FA Detail.")
                     document_types = [name for name, _ in special_documents]
                     if len(set(document_types)) != len(document_types):
                         raise ValueError("Pilih satu Rincian Kertas Kerja dan satu Laporan FA Detail, bukan dua file dengan jenis yang sama.")
-                    sheets = {
-                        "Perbandingan Anggaran RO": combine_budget_documents(special_documents),
-                    }
-                elif len(parsed_files) == 1:
-                    sheets = parsed_files[0][1]
-                else:
-                    sheets = {}
-                    for filename, file_sheets in parsed_files:
-                        for sheet_name, rows in file_sheets.items():
-                            label = "{} — {}".format(Path(filename).stem, sheet_name)
-                            sheets[label] = rows
-                if not sheets or not any(any(clean_text(value) for row in rows for value in row) for rows in sheets.values()):
+                    source_tables.insert(0, (
+                        "Perbandingan Anggaran RO",
+                        combine_budget_documents(special_documents),
+                    ))
+                if not source_tables or not any(
+                    any(clean_text(value) for row in rows for value in row)
+                    for _, rows in source_tables
+                ):
                     raise ValueError("Tidak ada isi tabel yang dapat dibaca dari file.")
+                sheets = {}
+                analyses = {}
+                for label, rows in source_tables:
+                    unique_label = label
+                    suffix = 2
+                    while unique_label in sheets:
+                        unique_label = "{} ({})".format(label, suffix)
+                        suffix += 1
+                    sheets[unique_label] = rows
+                    analyses[unique_label] = analyze_rows(rows, unique_label)
+                if len(source_tables) > 1:
+                    combined_label = "Gabungan semua file"
+                    analyses[combined_label] = analyze_combined_tables(source_tables)
+                    default_selection = combined_label
+                else:
+                    default_selection = next(iter(sheets))
                 st.session_state.upload_name = ", ".join(filename for filename, _ in file_contents)
                 st.session_state.upload_key = upload_key
                 st.session_state.sheets = sheets
-                preferred = next((name for name in sheets if re.search(r"rab|anggaran", name, re.I)), next(iter(sheets)))
-                st.session_state.selected_sheet = preferred
+                st.session_state.analyses = analyses
+                st.session_state.selected_sheet = default_selection
                 st.session_state.pop("tor_result", None)
                 for key in ("tor_activity", "tor_location", "tor_year", "tor_notes", "tor_ro_code", "_tor_activity_ro"):
                     st.session_state.pop(key, None)
@@ -1131,7 +1307,9 @@ def load_analysis():
     names = list(sheets)
     chosen = st.selectbox("Pilih sheet / tabel", names, index=names.index(st.session_state.get("selected_sheet", names[0])) if st.session_state.get("selected_sheet") in names else 0)
     st.session_state.selected_sheet = chosen
-    analysis = analyze_rows(sheets[chosen], chosen)
+    analysis = st.session_state.get("analyses", {}).get(chosen)
+    if analysis is None:
+        analysis = analyze_rows(sheets[chosen], chosen)
     return chosen, analysis
 
 
@@ -1143,6 +1321,8 @@ def render_dashboard(data):
     st.caption("{} · {} baris anggaran disiapkan; {} baris disaring.".format(
         analysis["sheet"], len(analysis["rows"]), analysis["excluded_count"]
     ))
+    if analysis.get("sources"):
+        st.caption("Sumber gabungan: {}".format(" · ".join(analysis["sources"])))
     categories = analysis.get("categories", [])
     comparison = analysis.get("budget_comparison")
     if comparison:
@@ -1399,7 +1579,123 @@ def build_tor_sections(activity, location, year, notes, analysis, selected_row=N
     ]
 
 
-def make_tor_docx(activity, location, year, sheet_name, sections, ro_code="", budget_data=None):
+def find_local_tor_template():
+    templates = sorted(ROOT.glob("[[]Template[]]*.docx"))
+    return templates[0] if templates else None
+
+
+def set_docx_paragraph_text(paragraph, text):
+    if paragraph.runs:
+        paragraph.runs[0].text = text
+        for run in paragraph.runs[1:]:
+            run.text = ""
+    else:
+        paragraph.add_run(text)
+
+
+def make_tor_from_local_template(activity, location, year, sheet_name, notes, ro_code, budget_data):
+    template_path = find_local_tor_template()
+    if template_path is None:
+        return None
+
+    document = Document(str(template_path))
+    for paragraph in document.paragraphs:
+        text = paragraph.text.strip()
+        if re.fullmatch(r"TAHUN\s+\d{4}", text, re.I):
+            set_docx_paragraph_text(paragraph, "TAHUN {}".format(year))
+        elif re.fullmatch(r"KELUARAN \(OUTPUT\) TA\s+\d{4}", text, re.I):
+            set_docx_paragraph_text(paragraph, "KELUARAN (OUTPUT) TA {}".format(year))
+        elif text.casefold() in {
+            "latar belakang",
+            "gambaran umum",
+            "kpi output",
+            "analisis biaya dan manfaat",
+            "manajemen risiko",
+        }:
+            for run in paragraph.runs:
+                run.font.highlight_color = WD_COLOR_INDEX.YELLOW
+
+    if document.tables:
+        metadata = document.tables[0]
+        parts = ro_code.split(".") if ro_code else []
+        if len(metadata.rows) >= 4 and len(metadata.columns) >= 3:
+            if len(parts) >= 2:
+                set_docx_paragraph_text(metadata.cell(2, 1).paragraphs[0], ".".join(parts[:2]))
+            if ro_code:
+                set_docx_paragraph_text(metadata.cell(3, 1).paragraphs[0], ro_code)
+            set_docx_paragraph_text(metadata.cell(3, 2).paragraphs[0], activity)
+            for label, value in (
+                ("Lokasi Pelaksanaan", location),
+                ("Sumber Data", sheet_name),
+                ("Tujuan / Catatan", notes or "[PERLU DILENGKAPI]"),
+            ):
+                cells = metadata.add_row().cells
+                set_docx_paragraph_text(cells[0].paragraphs[0], label)
+                set_docx_paragraph_text(cells[1].paragraphs[0], ":")
+                set_docx_paragraph_text(cells[2].paragraphs[0], value)
+
+    if len(document.tables) > 5 and document.tables[5].rows:
+        schedule = document.tables[5]
+        for cell in schedule.rows[0].cells[2:]:
+            set_docx_paragraph_text(cell.paragraphs[0], year)
+
+    for table_index in (4, 5, 6, 7, 8, 9):
+        if table_index < len(document.tables) and document.tables[table_index].rows:
+            for cell in document.tables[table_index].rows[0].cells:
+                for paragraph in cell.paragraphs:
+                    for run in paragraph.runs:
+                        run.font.highlight_color = WD_COLOR_INDEX.YELLOW
+
+    if len(document.tables) > 8 and len(document.tables[8].rows) > 1:
+        financing = document.tables[8]
+        if budget_data:
+            budget_text = (
+                "Biaya kegiatan {}: pagu penuh {}, pagu efektif {}, pagu terblokir {}, "
+                "realisasi {}, dan sisa anggaran {}."
+            ).format(
+                activity,
+                format_rupiah(budget_data.get("Pagu Penuh")),
+                format_rupiah(budget_data.get("Pagu Efektif")),
+                format_rupiah(budget_data.get("Pagu Terblokir")),
+                format_rupiah(budget_data.get("Realisasi")),
+                format_rupiah(budget_data.get("Sisa anggaran")),
+            )
+            set_docx_paragraph_text(financing.cell(1, 0).paragraphs[0], budget_text)
+            set_docx_paragraph_text(
+                financing.cell(1, 1).paragraphs[0],
+                "[PERLU DISESUAIKAN] Lengkapi manfaat yang sesuai dengan RO terpilih.",
+            )
+            for row in financing.rows[2:5]:
+                set_docx_paragraph_text(
+                    row.cells[0].paragraphs[0],
+                    "[PERLU DIISI] Komponen biaya yang sesuai dengan RO terpilih.",
+                )
+                set_docx_paragraph_text(
+                    row.cells[1].paragraphs[0],
+                    "[PERLU DIISI] Manfaat dari komponen biaya tersebut.",
+                )
+
+    note = document.add_paragraph()
+    note.paragraph_format.space_before = Pt(8)
+    note_run = note.add_run(
+        "CATATAN DRAFT: Bagian bertanda kuning perlu ditinjau dan disesuaikan sebelum TOR disahkan."
+    )
+    note_run.font.name = "Times New Roman"
+    note_run.font.size = Pt(10)
+    note_run.font.highlight_color = WD_COLOR_INDEX.YELLOW
+
+    output = io.BytesIO()
+    document.save(output)
+    return output.getvalue()
+
+
+def make_tor_docx(activity, location, year, sheet_name, sections, ro_code="", budget_data=None, notes=""):
+    template_document = make_tor_from_local_template(
+        activity, location, year, sheet_name, notes, ro_code, budget_data,
+    )
+    if template_document is not None:
+        return template_document
+
     document = Document()
     section = document.sections[0]
     section.page_width = Inches(8.27)
@@ -1503,6 +1799,14 @@ def render_tor(data):
         st.info("Unggah RAB pada tab Dashboard untuk menghubungkan data dan membuat draft TOR.")
         return
     sheet, analysis = data
+    if find_local_tor_template():
+        st.caption("Model TOR lokal digunakan langsung; file template tidak perlu diunggah.")
+    else:
+        st.caption("Template Word lokal tidak ditemukan; generator memakai model format TOR bawaan aplikasi.")
+    st.info(
+        "Bagian penerima manfaat, jadwal, indikator, biaya/manfaat, dan risiko yang ditandai kuning "
+        "perlu ditinjau untuk RO terpilih sebelum TOR digunakan."
+    )
     selected_row = None
     if analysis.get("budget_comparison"):
         ro_rows = [row for row in analysis["rows"] if row["Kode"]]
@@ -1549,6 +1853,7 @@ def render_tor(data):
                 "sections": sections,
                 "ro_code": selected_row["Kode"] if selected_row else "",
                 "budget_data": selected_row,
+                "notes": notes.strip(),
             }
     result = st.session_state.get("tor_result")
     if result:
@@ -1571,6 +1876,7 @@ def render_tor(data):
             result["sections"],
             ro_code=result.get("ro_code", ""),
             budget_data=result.get("budget_data"),
+            notes=result.get("notes", ""),
         )
         safe_name = re.sub(r"[^a-z0-9]+", "-", result["activity"].lower()).strip("-") or "draft"
         if result.get("ro_code"):
