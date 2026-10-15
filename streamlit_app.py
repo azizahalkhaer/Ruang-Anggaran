@@ -50,8 +50,11 @@ def to_number(value):
         else:
             text = text.replace(",", "")
     elif "," in text:
-        head, tail = text.rsplit(",", 1)
-        text = head + tail if len(tail) == 3 and head.lstrip("-").isdigit() else head + "." + tail
+        if re.fullmatch(r"-?\d{1,3}(?:,\d{3})+", text):
+            text = text.replace(",", "")
+        else:
+            head, tail = text.rsplit(",", 1)
+            text = head + "." + tail
     elif "." in text:
         if re.fullmatch(r"-?\d{1,3}(?:\.\d{3})+", text):
             text = text.replace(".", "")
@@ -106,6 +109,77 @@ def parse_sp2d_rows(rows):
     return normalized
 
 
+def parse_sp2d_text(pages_text):
+    if not any(re.search(r"LAPORAN REALISASI SP2D", text, re.I) for text in pages_text):
+        return None
+
+    code_pattern = re.compile(r"^\s*(?P<code>\d{3}|\d{6})\.?\s+(?P<description>.*)$")
+    amount_pattern = re.compile(r"(?<![\w,])\d{1,3}(?:,\d{3})+(?![\w,])")
+    number_pattern = re.compile(r"(?<![\w,])(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?![\w,])")
+    normalized = [["Kode Anggaran", "Uraian", "Pagu", "Sisa Anggaran"]]
+
+    for page_text in pages_text:
+        pending = None
+        wrapped_row = None
+        for line in page_text.splitlines():
+            text = line.strip()
+            if not text:
+                continue
+            if re.search(r"^(?:Uraian\s+Pagu|Realisasi TA|Periode Lalu|SISA\s+ANGGARAN)", text, re.I):
+                pending = None
+                wrapped_row = None
+                continue
+
+            code_match = code_pattern.match(line)
+            amount_match = amount_pattern.search(line)
+            if code_match:
+                wrapped_row = None
+                code = code_match.group("code")
+                description_start = code_match.start("description")
+                if amount_match:
+                    amounts = number_pattern.findall(line[amount_match.start():])
+                    if len(amounts) >= 6:
+                        normalized.append([
+                            code,
+                            line[description_start:amount_match.start()].strip(),
+                            to_number(amounts[0]),
+                            to_number(amounts[-1]),
+                        ])
+                    pending = None
+                else:
+                    pending = [code, code_match.group("description").strip()]
+                continue
+
+            if amount_match:
+                amounts = number_pattern.findall(line[amount_match.start():])
+                if pending and len(amounts) >= 6:
+                    normalized.append([
+                        pending[0],
+                        pending[1],
+                        to_number(amounts[0]),
+                        to_number(amounts[-1]),
+                    ])
+                    wrapped_row = normalized[-1]
+                    pending = None
+                else:
+                    pending = None
+                    wrapped_row = None
+                continue
+
+            if pending:
+                pending[1] = "{} {}".format(pending[1], text).strip()
+            elif wrapped_row:
+                wrapped_row[1] = "{} {}".format(wrapped_row[1], text).strip()
+
+    valid_rows = [
+        row for row in normalized[1:]
+        if row[1] and row[2] is not None and row[2] > 0 and row[3] is not None and row[3] >= 0
+    ]
+    if not valid_rows:
+        raise ValueError("Rincian SP2D pada PDF terdeteksi, tetapi nilai pagu dan sisa tidak terbaca.")
+    return [normalized[0]] + valid_rows
+
+
 def parse_upload(name, content):
     extension = Path(name).suffix.lower()
     if len(content) > MAX_UPLOAD_SIZE:
@@ -154,12 +228,17 @@ def parse_upload(name, content):
         except ImportError as error:
             raise ValueError("Dukungan PDF belum tersedia. Pasang dependensi yang tercantum di requirements.txt.") from error
         pages_text = []
+        sp2d_pages_text = []
         table_rows = []
         with pdfplumber.open(io.BytesIO(content)) as pdf:
             for page in pdf.pages:
                 for table in page.extract_tables() or []:
                     table_rows.extend(table)
                 pages_text.append(page.extract_text(layout=False) or "")
+                sp2d_pages_text.append(page.extract_text(layout=True) or "")
+        sp2d = parse_sp2d_text(sp2d_pages_text)
+        if sp2d:
+            return {"Realisasi SP2D": sp2d}
         rows = trim_rows(table_rows) if table_rows else split_text_rows("\n".join(pages_text))
         sp2d = parse_sp2d_rows(rows)
         if sp2d:

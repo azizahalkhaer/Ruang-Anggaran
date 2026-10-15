@@ -12,6 +12,7 @@ import streamlit_app
 class StreamlitAppTests(unittest.TestCase):
     def test_to_number_handles_indonesian_and_plain_amounts(self):
         self.assertEqual(streamlit_app.to_number("Rp 1.234.567"), 1234567)
+        self.assertEqual(streamlit_app.to_number("1,234,567"), 1234567)
         self.assertEqual(streamlit_app.to_number("1234,5"), 1234.5)
         self.assertIsNone(streamlit_app.to_number("—"))
 
@@ -57,6 +58,25 @@ class StreamlitAppTests(unittest.TestCase):
         self.assertEqual(len(analysis["rows"]), 2)
         self.assertEqual(len(analysis["categories"]), 2)
         self.assertEqual(analysis["category_total"], 180000)
+
+    def test_sp2d_pdf_text_parser_reads_category_and_wrapped_detail_rows(self):
+        pages = ["""
+LAPORAN REALISASI SP2D TA 2026
+                       Uraian                    Pagu Revisi Lock Pagu
+     100 Kegiatan pertama                     1,000,000 0 500,000 0 500,000 50.00 % 500,000
+       101 Kegiatan kedua                      2,000,000 0 1,000,000 0 1,000,000 50.00 % 1,000,000
+              000001. Rincian kegiatan yang
+                                          100,000 0 50,000 0 50,000 50.00 % 50,000
+                 keterangannya terbungkus
+"""]
+
+        rows = streamlit_app.parse_sp2d_text(pages)
+
+        self.assertEqual(rows[0], ["Kode Anggaran", "Uraian", "Pagu", "Sisa Anggaran"])
+        self.assertEqual(rows[1], ["100", "Kegiatan pertama", 1000000, 500000])
+        self.assertEqual(rows[2], ["101", "Kegiatan kedua", 2000000, 1000000])
+        self.assertEqual(rows[3], ["000001", "Rincian kegiatan yang keterangannya terbungkus", 100000, 50000])
+        self.assertIsNone(streamlit_app.parse_sp2d_text(["PDF laporan lain"]))
 
     def test_tor_download_is_a_valid_word_document(self):
         analysis = {
