@@ -33,6 +33,24 @@ class StreamlitAppTests(unittest.TestCase):
                 self.assertFalse(streamlit_app.password_matches("wrong-password", account["salt"], account["digest"]))
                 self.assertFalse(streamlit_app.create_account("staff@example.com", salt, digest))
 
+    def test_signup_is_limited_to_configured_office_network_ranges(self):
+        allowed, _ = streamlit_app.signup_network_status(
+            "10.20.30.45",
+            "10.20.30.0/24,198.51.100.7/32",
+        )
+        self.assertTrue(allowed)
+
+        guest_allowed, message = streamlit_app.signup_network_status(
+            "10.20.31.45",
+            "10.20.30.0/24",
+        )
+        self.assertFalse(guest_allowed)
+        self.assertIn("BALMON LOBBY TAMU", message)
+
+        unconfigured, message = streamlit_app.signup_network_status("10.20.30.45", "")
+        self.assertFalse(unconfigured)
+        self.assertIn("SIGNUP_ALLOWED_CIDRS", message)
+
     def test_revision_compares_remaining_to_increase(self):
         rows = [
             ["", "Semula", None, None, "Menjadi", None, None, None, None],
@@ -78,6 +96,41 @@ LAPORAN REALISASI SP2D TA 2026
         self.assertEqual(rows[3], ["000001", "Rincian kegiatan yang keterangannya terbungkus", 100000, 50000])
         self.assertIsNone(streamlit_app.parse_sp2d_text(["PDF laporan lain"]))
 
+    def test_budget_pdf_parsers_combine_ro_budget_and_financial_values(self):
+        workplan = streamlit_app.parse_rincian_kertas_text(["""
+RINCIAN KERTAS KERJA SATKER T.A. 2026
+ALOKASI Rp. 1,500,000
+7437.BAH.078 Layanan Dukungan RO 1.0 layanan 1,500,000
+- Rincian terblokir 100,000 100,000 *
+"""])
+        financial = streamlit_app.parse_fa_text(["""
+LAPORAN REALISASI SP2D TA 2026
+JUMLAH SELURUHNYA 1,000,000 0 400,000 0 400,000 40.00 % 600,000
+BAH.078 Layanan Dukungan RO 1,000,000 0 400,000 0 400,000 40.00 % 600,000
+"""])
+
+        rows = streamlit_app.combine_budget_documents([
+            ("Rincian Kertas Kerja", workplan),
+            ("Laporan FA Detail", financial),
+        ])
+        analysis = streamlit_app.analyze_rows(rows, "Perbandingan Anggaran RO")
+
+        self.assertEqual(analysis["budget_comparison"]["pagu_penuh"], 1500000)
+        self.assertEqual(analysis["budget_comparison"]["pagu_efektif"], 1000000)
+        self.assertEqual(analysis["budget_comparison"]["realisasi"], 400000)
+        self.assertEqual(analysis["budget_comparison"]["sisa"], 600000)
+        self.assertEqual(analysis["budget_comparison"]["pagu_terblokir"], 100000)
+        ro = analysis["rows"][0]
+        self.assertEqual(ro["Kode"], "7437.BAH.078")
+        self.assertEqual(ro["Status Pasangan"], "Cocok berdasarkan kode RO")
+        sections = streamlit_app.build_tor_sections(
+            ro["Uraian"], "Surabaya", "2026", "", analysis, selected_row=ro,
+        )
+        financing = next(body for title, body in sections if title == "VII. Pembiayaan")
+        self.assertIn("Kode RO: 7437.BAH.078", financing)
+        self.assertIn("Pagu penuh: Rp 1.500.000", financing)
+        self.assertIn("Pagu terblokir: Rp 100.000", financing)
+
     def test_tor_download_is_a_valid_word_document(self):
         analysis = {
             "sheet": "RAB Rev 9",
@@ -92,13 +145,45 @@ LAPORAN REALISASI SP2D TA 2026
         sections = streamlit_app.build_tor_sections(
             "Monitoring", "Surabaya", "2026", "", analysis,
         )
-        content = streamlit_app.make_tor_docx("Monitoring", "Surabaya", "2026", analysis["sheet"], sections)
+        content = streamlit_app.make_tor_docx(
+            "Monitoring",
+            "Surabaya",
+            "2026",
+            analysis["sheet"],
+            sections,
+            ro_code="7437.BAH.078",
+            budget_data={
+                "Pagu Penuh": 150000,
+                "Pagu Efektif": 140000,
+                "Pagu Terblokir": 10000,
+                "Realisasi": 80000,
+                "Sisa anggaran": 60000,
+            },
+        )
         document = Document(io.BytesIO(content))
-        self.assertEqual(document.paragraphs[0].text, "KERANGKA ACUAN KERJA")
+        self.assertEqual(document.paragraphs[0].text, "TOR (TERM OF REFERENCE)")
         self.assertIn("VII. Pembiayaan", [paragraph.text for paragraph in document.paragraphs])
-        self.assertTrue(any(paragraph.text.startswith("Sumber data: RAB Rev 9") for paragraph in document.paragraphs))
+        table_text = [cell.text for table in document.tables for row in table.rows for cell in row.cells]
+        self.assertIn("Sumber Data", table_text)
+        self.assertIn("RAB Rev 9", table_text)
+        self.assertTrue(any(
+            "7437.BAH.078" in cell
+            for cell in table_text
+        ))
+        self.assertTrue(any(
+            "Pagu Efektif" in cell
+            for cell in table_text
+        ))
+        self.assertTrue(any(
+            "Rp 140.000" in cell
+            for cell in table_text
+        ))
         self.assertIn("TOR ini menjadi acuan pelaksanaan Monitoring pada tahun 2026, berdasarkan data pada sheet RAB Rev 9.", sections[0][1])
         self.assertLess(max(len(body) for _, body in sections), 180)
+        body = next(paragraph for paragraph in document.paragraphs if paragraph.text.startswith("TOR ini menjadi"))
+        self.assertEqual(body.alignment, 3)
+        self.assertEqual(body.paragraph_format.line_spacing, 1.5)
+        self.assertEqual(body.runs[0].font.name, "Times New Roman")
 
 
 if __name__ == "__main__":

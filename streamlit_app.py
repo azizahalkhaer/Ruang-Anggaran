@@ -1,6 +1,8 @@
 import hashlib
 import hmac
+import ipaddress
 import io
+import os
 import re
 import secrets
 import sqlite3
@@ -10,22 +12,27 @@ from pathlib import Path
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from streamlit.errors import StreamlitSecretNotFoundError
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Inches, Pt, RGBColor
 
-import streamlit.components.v1 as components
-
-
 st.set_page_config(page_title="Ruang Anggaran — Dashboard RAB & TOR",page_icon="balmon.png", layout="wide")
 ROOT = Path(__file__).resolve().parent
-IDENTITY_COMPONENT = components.declare_component(
-    "balmon_identity_check",
-    path=str(ROOT / "identity_component"),
-)
 COLORS = ["#092759", "#087cb5", "#3d91b8", "#7a9bb5", "#a8bbc9", "#c3ccd4"]
 MAX_UPLOAD_SIZE = 20 * 1024 * 1024
 ACCOUNT_DB_PATH = ROOT / ".data" / "accounts.sqlite3"
+BUDGET_HEADERS = [
+    "_Jenis",
+    "Kode Anggaran",
+    "Uraian",
+    "Pagu Penuh",
+    "Pagu Efektif",
+    "Pagu Terblokir",
+    "Realisasi",
+    "Sisa Anggaran",
+    "Status Pasangan",
+]
 
 
 def clean_text(value):
@@ -180,6 +187,217 @@ def parse_sp2d_text(pages_text):
     return [normalized[0]] + valid_rows
 
 
+def parse_rincian_kertas_text(pages_text):
+    if not any(re.search(r"RINCIAN KERTAS KERJA SATKER", text, re.I) for text in pages_text):
+        return None
+
+    ro_pattern = re.compile(r"(?<![\w.])(?P<code>\d{4}\.[A-Z0-9]{3}\.[A-Z0-9]{3})(?![\w.])", re.I)
+    amount_pattern = re.compile(r"(?<![\w,])\d{1,3}(?:,\d{3})+(?![\w,])")
+    total_allocation = None
+    current_ro = None
+    ro_rows = {}
+    blocked_total = 0
+
+    for page_text in pages_text:
+        pending_description = None
+        previous_line_amounts = []
+        for line in page_text.splitlines():
+            line_amounts = list(amount_pattern.finditer(line))
+            if total_allocation is None and re.search(r"\bALOKASI\b", line, re.I):
+                if line_amounts:
+                    total_allocation = to_number(line_amounts[-1].group(0))
+
+            if re.search(r"^\s*(?:RINCIAN KERTAS|KEMEN/LEMB|UNIT ORG|UNIT KERJA|ALOKASI|Halaman\s*:|PROGRAM/|KODE\s*$|\([1-6]\))", line, re.I):
+                pending_description = None
+                previous_line_amounts = []
+                continue
+            code_match = ro_pattern.search(line)
+            if code_match:
+                current_ro = code_match.group("code").upper()
+                tail = line[code_match.end():]
+                amounts = list(amount_pattern.finditer(tail))
+                description = tail[:amounts[0].start()].strip() if amounts else tail.strip()
+                description = re.sub(r"\s+\d+(?:\.\d+)?\s+\S+$", "", description).strip()
+                amount = to_number(amounts[-1].group(0)) if amounts else (
+                    to_number(previous_line_amounts[-1]) if previous_line_amounts else None
+                )
+                row = ro_rows.setdefault(current_ro, {
+                    "code": current_ro,
+                    "description": description,
+                    "full_budget": 0,
+                    "blocked": 0,
+                })
+                if description:
+                    row["description"] = "{} {}".format(row["description"], description).strip() if row["description"] and row["description"] not in description else description
+                if amount is not None:
+                    row["full_budget"] += amount
+                pending_description = current_ro
+                previous_line_amounts = [match.group(0) for match in line_amounts]
+                continue
+
+            if pending_description:
+                continuation = line.strip()
+                if (
+                    continuation
+                    and not line_amounts
+                    and not re.match(r"^(?:\d+(?:\.\d+)?\s|[A-Z]\s|[-•])", continuation, re.I)
+                ):
+                    ro_rows[pending_description]["description"] = "{} {}".format(
+                        ro_rows[pending_description]["description"], continuation
+                    ).strip()
+                pending_description = None
+
+            amounts = list(amount_pattern.finditer(line))
+            if re.search(r"\*\s*$", line) and current_ro and amounts:
+                blocked = to_number(amounts[-1].group(0)) or 0
+                ro_rows[current_ro]["blocked"] += blocked
+                blocked_total += blocked
+                previous_line_amounts = []
+                continue
+            previous_line_amounts = [match.group(0) for match in line_amounts]
+
+    rows = [BUDGET_HEADERS]
+    rows.append([
+        "TOTAL", "TOTAL", "ALOKASI", total_allocation, None, blocked_total, None, None, "TOTAL",
+    ])
+    for item in ro_rows.values():
+        rows.append([
+            "RO", item["code"], item["description"], item["full_budget"] or None,
+            None, item["blocked"], None, None, "Menunggu Laporan FA",
+        ])
+    if total_allocation is None and not ro_rows:
+        raise ValueError("PDF Rincian Kertas Kerja terdeteksi, tetapi nilai alokasi dan kode RO tidak terbaca.")
+    return rows
+
+
+def parse_fa_text(pages_text):
+    if not any(re.search(r"LAPORAN REALISASI SP2D", text, re.I) for text in pages_text):
+        return None
+
+    ro_pattern = re.compile(r"^\s*(?P<code>[A-Z0-9]{3}\.[A-Z0-9]{3})\s+(?P<description>.*)$", re.I)
+    amount_pattern = re.compile(r"(?<![\w,])\d{1,3}(?:,\d{3})+(?![\w,])")
+    number_pattern = re.compile(r"(?<![\w,])(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?![\w,])")
+    overall = None
+    ro_rows = {}
+
+    def get_metrics(text, start):
+        tokens = number_pattern.findall(text[start:])
+        values = [to_number(token) for token in tokens]
+        values = [value for value in values if value is not None]
+        percent = re.search(r"\d+(?:\.\d+)?\s*%", text[start:])
+        if percent:
+            before_percent = number_pattern.findall(text[start:start + percent.start()])
+            after_percent = number_pattern.findall(text[start + percent.end():])
+            if len(before_percent) < 5 or not after_percent:
+                return None
+            return to_number(before_percent[0]), to_number(before_percent[-1]), to_number(after_percent[0])
+        if len(values) < 3:
+            return None
+        if len(values) >= 5:
+            return values[0], values[-2], values[-1]
+        return values[0], values[-2], values[-1]
+
+    for page_text in pages_text:
+        for line in page_text.splitlines():
+            if re.search(r"\bJUMLAH SELURUHNYA\b", line, re.I):
+                amount_match = amount_pattern.search(line)
+                if amount_match:
+                    overall = get_metrics(line, amount_match.start())
+                continue
+
+            code_match = ro_pattern.match(line)
+            if not code_match:
+                continue
+            tail = code_match.group("description")
+            amount_match = amount_pattern.search(tail)
+            if not amount_match:
+                continue
+            metrics = get_metrics(tail, amount_match.start())
+            if not metrics:
+                continue
+            ro_rows[code_match.group("code").upper()] = {
+                "code": code_match.group("code").upper(),
+                "description": tail[:amount_match.start()].strip(),
+                "effective": metrics[0],
+                "realized": metrics[1],
+                "remaining": metrics[2],
+            }
+
+    rows = [BUDGET_HEADERS]
+    if overall:
+        rows.append([
+            "TOTAL", "TOTAL", "JUMLAH SELURUHNYA", None, overall[0], None,
+            overall[1], overall[2], "TOTAL",
+        ])
+    for item in ro_rows.values():
+        rows.append([
+            "RO", item["code"], item["description"], None, item["effective"], None,
+            item["realized"], item["remaining"], "Menunggu Rincian Kertas Kerja",
+        ])
+    if not overall and not ro_rows:
+        raise ValueError("Laporan FA terdeteksi, tetapi pagu revisi, realisasi, dan sisa tidak terbaca.")
+    return rows
+
+
+def normalize_ro_code(code):
+    code = clean_text(code).upper()
+    match = re.search(r"(?:\d{4}\.)?([A-Z0-9]{3}\.[A-Z0-9]{3})$", code)
+    return match.group(1) if match else code
+
+
+def combine_budget_documents(documents):
+    rkk_rows = []
+    fa_rows = []
+    for name, rows in documents:
+        if name == "Rincian Kertas Kerja":
+            rkk_rows.extend(rows[1:])
+        elif name == "Laporan FA Detail":
+            fa_rows.extend(rows[1:])
+
+    rkk_total = next((row for row in rkk_rows if row[0] == "TOTAL"), None)
+    fa_total = next((row for row in fa_rows if row[0] == "TOTAL"), None)
+    rkk_by_code = {
+        normalize_ro_code(row[1]): row for row in rkk_rows
+        if row[0] == "RO" and normalize_ro_code(row[1])
+    }
+    fa_by_code = {
+        normalize_ro_code(row[1]): row for row in fa_rows
+        if row[0] == "RO" and normalize_ro_code(row[1])
+    }
+    codes = list(dict.fromkeys(list(rkk_by_code) + list(fa_by_code)))
+    rows = [BUDGET_HEADERS]
+    rows.append([
+        "TOTAL",
+        "TOTAL",
+        "JUMLAH SELURUHNYA",
+        rkk_total[3] if rkk_total else None,
+        fa_total[4] if fa_total else None,
+        rkk_total[5] if rkk_total else None,
+        fa_total[6] if fa_total else None,
+        fa_total[7] if fa_total else None,
+        "TOTAL",
+    ])
+    for code in codes:
+        rkk = rkk_by_code.get(code)
+        fa = fa_by_code.get(code)
+        source = rkk or fa
+        full_code = rkk[1] if rkk else fa[1]
+        description = rkk[2] if rkk and rkk[2] else fa[2]
+        status = "Cocok berdasarkan kode RO" if rkk and fa else "Hanya di Rincian Kertas Kerja" if rkk else "Hanya di Laporan FA"
+        rows.append([
+            "RO",
+            full_code,
+            description or source[2],
+            rkk[3] if rkk else None,
+            fa[4] if fa else None,
+            rkk[5] if rkk else None,
+            fa[6] if fa else None,
+            fa[7] if fa else None,
+            status,
+        ])
+    return rows
+
+
 def parse_upload(name, content):
     extension = Path(name).suffix.lower()
     if len(content) > MAX_UPLOAD_SIZE:
@@ -236,6 +454,12 @@ def parse_upload(name, content):
                     table_rows.extend(table)
                 pages_text.append(page.extract_text(layout=False) or "")
                 sp2d_pages_text.append(page.extract_text(layout=True) or "")
+        workplan = parse_rincian_kertas_text(sp2d_pages_text)
+        if workplan:
+            return {"Rincian Kertas Kerja": workplan}
+        financial_report = parse_fa_text(sp2d_pages_text)
+        if financial_report:
+            return {"Laporan FA Detail": financial_report}
         sp2d = parse_sp2d_text(sp2d_pages_text)
         if sp2d:
             return {"Realisasi SP2D": sp2d}
@@ -376,7 +600,105 @@ def find_revision(rows):
     }
 
 
+def analyze_budget_rows(rows, sheet_name):
+    header = rows[0]
+    positions = {name: header.index(name) for name in BUDGET_HEADERS}
+    total = next((row for row in rows[1:] if row[positions["_Jenis"]] == "TOTAL"), [])
+    prepared = []
+    for index, raw in enumerate(rows[1:], start=2):
+        if raw[positions["_Jenis"]] != "RO":
+            continue
+        code = clean_text(raw[positions["Kode Anggaran"]])
+        description = clean_text(raw[positions["Uraian"]])
+        if not code and not description:
+            continue
+        full = to_number(raw[positions["Pagu Penuh"]])
+        effective = to_number(raw[positions["Pagu Efektif"]])
+        prepared.append({
+            "Kode": code,
+            "Uraian": description,
+            "Pagu": effective if effective is not None else full,
+            "Pagu Penuh": full,
+            "Pagu Efektif": effective,
+            "Pagu Terblokir": to_number(raw[positions["Pagu Terblokir"]]),
+            "Realisasi": to_number(raw[positions["Realisasi"]]),
+            "Sisa anggaran": to_number(raw[positions["Sisa Anggaran"]]),
+            "Status Pasangan": clean_text(raw[positions["Status Pasangan"]]),
+            "Baris": index,
+            "_raw": list(raw),
+        })
+
+    def total_value(name):
+        return to_number(total[positions[name]]) if total else None
+
+    comparison = {
+        "pagu_penuh": total_value("Pagu Penuh"),
+        "pagu_efektif": total_value("Pagu Efektif"),
+        "pagu_terblokir": total_value("Pagu Terblokir"),
+        "realisasi": total_value("Realisasi"),
+        "sisa": total_value("Sisa Anggaran"),
+        "matched_count": sum(row["Status Pasangan"] == "Cocok berdasarkan kode RO" for row in prepared),
+        "unmatched_count": sum(row["Status Pasangan"] != "Cocok berdasarkan kode RO" for row in prepared),
+    }
+    categories = [
+        {
+            "Kode": row["Kode"],
+            "Kategori": "{} · {}".format(row["Kode"], row["Uraian"]),
+            "Pagu": row["Pagu"],
+            "Pagu Penuh": row["Pagu Penuh"],
+            "Pagu Efektif": row["Pagu Efektif"],
+            "Pagu Terblokir": row["Pagu Terblokir"],
+            "Realisasi": row["Realisasi"],
+            "Sisa": row["Sisa anggaran"],
+        }
+        for row in prepared if row["Pagu"] is not None and row["Pagu"] > 0
+    ]
+    categories.sort(key=lambda row: row["Pagu"], reverse=True)
+    insights = []
+    if comparison["pagu_terblokir"] is not None:
+        insights.append("Pagu terblokir yang ditandai * pada Rincian Kertas Kerja berjumlah {}.".format(
+            format_rupiah(comparison["pagu_terblokir"])
+        ))
+    if comparison["pagu_penuh"] is not None and comparison["pagu_efektif"] is not None:
+        difference = comparison["pagu_penuh"] - comparison["pagu_efektif"]
+        insights.append("Selisih pagu penuh dan pagu efektif: {}.".format(format_rupiah(difference)))
+    if comparison["pagu_efektif"] and comparison["realisasi"] is not None:
+        insights.append("Realisasi mencapai {:.1f}% dari pagu efektif.".format(
+            comparison["realisasi"] / comparison["pagu_efektif"] * 100
+        ))
+    if comparison["unmatched_count"]:
+        insights.append("{} kode RO belum memiliki pasangan pada kedua file; periksa status pasangan di tabel.".format(
+            comparison["unmatched_count"]
+        ))
+    if categories:
+        top = categories[0]
+        insights.append("{} memiliki pagu efektif terbesar di antara RO yang terbaca.".format(top["Kategori"]))
+
+    return {
+        "sheet": sheet_name,
+        "header_found": True,
+        "revision": None,
+        "rows": prepared,
+        "ranked": sorted(prepared, key=lambda row: row["Pagu"] or 0, reverse=True)[:5],
+        "categories": categories,
+        "columns": [(index, name) for index, name in enumerate(header) if name and not name.startswith("_")],
+        "money_col": positions["Pagu Efektif"],
+        "remaining_col": positions["Sisa Anggaran"],
+        "pagu_total": comparison["pagu_efektif"] or comparison["pagu_penuh"],
+        "remaining_total": comparison["sisa"],
+        "category_total": sum(row["Pagu"] for row in categories),
+        "category_remaining_total": sum(row["Sisa"] for row in categories if row["Sisa"] is not None),
+        "grouping": "rincian output (RO)",
+        "source_count": len(prepared),
+        "excluded_count": 0,
+        "insights": insights[:5],
+        "budget_comparison": comparison,
+    }
+
+
 def analyze_rows(rows, sheet_name):
+    if rows and rows[0] and rows[0][0] == "_Jenis":
+        return analyze_budget_rows(rows, sheet_name)
     header = find_header(rows)
     revision = find_revision(rows)
     if not header:
@@ -588,8 +910,41 @@ def create_account(email, salt, digest):
         return cursor.rowcount == 1
 
 
+def signup_network_status(client_ip, allowed_cidrs):
+    if not allowed_cidrs:
+        return False, "Pendaftaran belum diaktifkan. Admin perlu mengatur SIGNUP_ALLOWED_CIDRS ke jaringan internal kantor."
+    if not client_ip:
+        return False, "Jaringan tidak dapat diverifikasi. Hubungkan ke Wi-Fi kantor dan akses aplikasi melalui proxy kantor."
+    try:
+        address = ipaddress.ip_address(client_ip)
+        networks = [ipaddress.ip_network(value.strip(), strict=False) for value in allowed_cidrs.split(",") if value.strip()]
+    except ValueError:
+        return False, "Konfigurasi jaringan pendaftaran tidak valid. Hubungi admin aplikasi."
+    if not networks:
+        return False, "Pendaftaran belum diaktifkan. Admin perlu mengatur SIGNUP_ALLOWED_CIDRS ke jaringan internal kantor."
+    if any(address in network for network in networks):
+        return True, ""
+    return False, "Pendaftaran hanya tersedia melalui Wi-Fi internal Balmon (kecuali BALMON LOBBY TAMU)."
+
+
+def get_signup_network_status():
+    allowed_cidrs = os.environ.get("SIGNUP_ALLOWED_CIDRS", "")
+    if not allowed_cidrs:
+        try:
+            allowed_cidrs = st.secrets.get("SIGNUP_ALLOWED_CIDRS", "")
+        except StreamlitSecretNotFoundError:
+            allowed_cidrs = ""
+    forwarded_for = st.context.headers.get("X-Forwarded-For", "")
+    client_ip = forwarded_for.split(",", 1)[0].strip()
+    return signup_network_status(client_ip, allowed_cidrs)
+
+
 def logout():
-    for key in ("authenticated_email", "upload_name", "sheets", "selected_sheet", "tor_result"):
+    for key in (
+        "authenticated_email", "upload_name", "sheets", "selected_sheet", "tor_result",
+        "tor_activity", "tor_location", "tor_year", "tor_notes", "tor_ro_code", "_tor_activity_ro",
+        "pending_signup",
+    ):
         st.session_state.pop(key, None)
 
 
@@ -628,7 +983,7 @@ def render_auth():
                         column.image(str(path), use_container_width=True)
                 st.markdown("<h1>RAB &amp; TOR</h1>", unsafe_allow_html=True)
                 st.markdown("Masuk untuk membaca anggaran, melihat insight, dan menyusun draft TOR.")
-                st.caption("Foto kartu dan selfie diproses di browser. Pemeriksaan demo bukan bukti identitas atau akses pegawai; akun hanya aktif selama sesi.")
+                st.caption("Masuk dengan email dan kata sandi. Pendaftaran akun baru hanya dapat dilakukan dari jaringan internal Balmon; akun tersimpan untuk login berikutnya.")
 
             with form_panel:
                 mode = st.radio("Akses demo", ("Masuk", "Daftar"), horizontal=True, label_visibility="collapsed")
@@ -646,69 +1001,102 @@ def render_auth():
                         else:
                             st.error("Email atau kata sandi tidak cocok.")
                 else:
+                    allowed, network_message = get_signup_network_status()
+                    if not allowed:
+                        st.info(network_message)
                     with st.form("signup_form"):
                         email = st.text_input("Email", key="signup_email", autocomplete="email")
                         password = st.text_input("Kata sandi", type="password", key="signup_password")
-                        employee_number = st.text_input("Nomor pegawai pada kartu", max_chars=24)
-                        submitted = st.form_submit_button("Lanjut verifikasi kartu", type="primary", use_container_width=True)
+                        confirm_password = st.text_input("Ulangi kata sandi", type="password", key="signup_confirm_password")
+                        submitted = st.form_submit_button(
+                            "Buat akun",
+                            type="primary",
+                            use_container_width=True,
+                            disabled=not allowed,
+                        )
                     if submitted:
-                        if not re.fullmatch(r"\d{5,24}", re.sub(r"\D", "", employee_number)):
-                            st.error("Nomor pegawai harus berisi sedikitnya 5 angka.")
-                        elif "@" not in email or len(password) < 8:
-                            st.error("Masukkan email yang valid dan kata sandi minimal 8 karakter.")
-                        elif get_account(email.strip().lower()):
-                            st.error("Email sudah terdaftar.")
+                        normalized_email = email.strip().lower()
+                        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", normalized_email):
+                            st.error("Masukkan alamat email yang valid.")
+                        elif len(password) < 8:
+                            st.error("Kata sandi minimal 8 karakter.")
+                        elif password != confirm_password:
+                            st.error("Kata sandi dan konfirmasi tidak sama.")
+                        elif get_account(normalized_email):
+                            st.error("Email sudah terdaftar. Silakan masuk dengan akun tersebut.")
                         else:
                             salt, digest = hash_password(password)
-                            st.session_state.pending_signup = {
-                                "email": email.strip().lower(),
-                                "employee_number": re.sub(r"\D", "", employee_number),
-                                "salt": salt,
-                                "digest": digest,
-                            }
-                    pending = st.session_state.get("pending_signup")
-                    if pending:
-                        st.info("Pilih foto kartu, lalu ambil selfie dengan wajah dan seluruh nomor kartu terlihat jelas.")
-                        result = IDENTITY_COMPONENT(
-                            employee_number=pending["employee_number"],
-                            key="identity-verification",
-                            default=None,
-                            height=430,
-                        )
-                        if isinstance(result, dict) and result.get("verified"):
-                            if create_account(pending["email"], pending["salt"], pending["digest"]):
-                                st.session_state.authenticated_email = pending["email"]
+                            if create_account(normalized_email, salt, digest):
+                                st.session_state.authenticated_email = normalized_email
                                 st.session_state.pop("pending_signup", None)
-                                st.success("Pemeriksaan awal cocok. Akun demo dibuat.")
+                                st.success("Akun berhasil dibuat. Anda sudah masuk.")
                                 st.rerun()
                             else:
-                                st.session_state.pop("pending_signup", None)
                                 st.error("Email sudah terdaftar. Silakan masuk dengan akun tersebut.")
-                        elif isinstance(result, dict) and result.get("message"):
-                            st.error(result["message"])
 
 
 def load_analysis():
-    uploaded = st.file_uploader(
-        "Unggah file RAB",
+    uploads = st.file_uploader(
+        "Unggah file anggaran",
         type=["xlsx", "xls", "xlsm", "csv", "docx", "pdf"],
-        help="Maksimum 20 MB. PDF hasil pindai perlu OCR sebelum diunggah.",
+        help="Untuk perbandingan anggaran lengkap, pilih kedua PDF: Rincian Kertas Kerja Satker dan Laporan FA Detail. Maksimum 20 MB per file; PDF hasil pindai perlu OCR.",
+        accept_multiple_files=True,
     )
-    if uploaded is not None:
+    if uploads:
         try:
-            content = uploaded.getvalue()
-            upload_key = hashlib.sha256(uploaded.name.encode("utf-8") + content).hexdigest()
+            file_contents = [(uploaded.name, uploaded.getvalue()) for uploaded in uploads]
+            key_digest = hashlib.sha256()
+            for filename, content in file_contents:
+                key_digest.update(filename.encode("utf-8"))
+                key_digest.update(content)
+            upload_key = key_digest.hexdigest()
             if upload_key != st.session_state.get("upload_key"):
-                sheets = parse_upload(uploaded.name, content)
+                parsed_files = [
+                    (filename, parse_upload(filename, content))
+                    for filename, content in file_contents
+                ]
+                special_documents = []
+                other_files = []
+                for filename, sheets in parsed_files:
+                    special_sheets = [
+                        (sheet_name, rows)
+                        for sheet_name, rows in sheets.items()
+                        if sheet_name in ("Rincian Kertas Kerja", "Laporan FA Detail")
+                    ]
+                    if special_sheets:
+                        if len(special_sheets) != 1:
+                            raise ValueError("Unggah satu file Rincian Kertas Kerja dan satu Laporan FA Detail.")
+                        special_documents.extend(special_sheets)
+                    else:
+                        other_files.append((filename, sheets))
+                if special_documents:
+                    if other_files:
+                        raise ValueError("File Rincian Kertas Kerja dan Laporan FA hanya dapat digabung dengan kedua format tersebut.")
+                    if len(special_documents) > 2:
+                        raise ValueError("Unggah maksimal satu Rincian Kertas Kerja dan satu Laporan FA Detail.")
+                    document_types = [name for name, _ in special_documents]
+                    if len(set(document_types)) != len(document_types):
+                        raise ValueError("Pilih satu Rincian Kertas Kerja dan satu Laporan FA Detail, bukan dua file dengan jenis yang sama.")
+                    sheets = {
+                        "Perbandingan Anggaran RO": combine_budget_documents(special_documents),
+                    }
+                elif len(parsed_files) == 1:
+                    sheets = parsed_files[0][1]
+                else:
+                    sheets = {}
+                    for filename, file_sheets in parsed_files:
+                        for sheet_name, rows in file_sheets.items():
+                            label = "{} — {}".format(Path(filename).stem, sheet_name)
+                            sheets[label] = rows
                 if not sheets or not any(any(clean_text(value) for row in rows for value in row) for rows in sheets.values()):
                     raise ValueError("Tidak ada isi tabel yang dapat dibaca dari file.")
-                st.session_state.upload_name = uploaded.name
+                st.session_state.upload_name = ", ".join(filename for filename, _ in file_contents)
                 st.session_state.upload_key = upload_key
                 st.session_state.sheets = sheets
                 preferred = next((name for name in sheets if re.search(r"rab|anggaran", name, re.I)), next(iter(sheets)))
                 st.session_state.selected_sheet = preferred
                 st.session_state.pop("tor_result", None)
-                for key in ("tor_activity", "tor_location", "tor_year", "tor_notes"):
+                for key in ("tor_activity", "tor_location", "tor_year", "tor_notes", "tor_ro_code", "_tor_activity_ro"):
                     st.session_state.pop(key, None)
         except Exception as error:
             st.error("File tidak dapat diproses: {}".format(error))
@@ -733,13 +1121,25 @@ def render_dashboard(data):
         analysis["sheet"], len(analysis["rows"]), analysis["excluded_count"]
     ))
     categories = analysis.get("categories", [])
-    pagu_for_card = analysis.get("category_total") if categories else analysis.get("pagu_total")
-    remaining_for_card = analysis.get("category_remaining_total") if categories else analysis.get("remaining_total")
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Total pagu kategori", format_compact_rupiah(pagu_for_card))
-    col2.metric("Sisa anggaran", format_compact_rupiah(remaining_for_card))
-    col3.metric("Kategori dianalisis", len(categories))
-    col4.metric("Rincian bernilai", len(analysis["rows"]))
+    comparison = analysis.get("budget_comparison")
+    if comparison:
+        metric_columns = st.columns(5)
+        metric_columns[0].metric("Pagu penuh", format_compact_rupiah(comparison["pagu_penuh"]))
+        metric_columns[1].metric("Pagu efektif", format_compact_rupiah(comparison["pagu_efektif"]))
+        metric_columns[2].metric("Pagu terblokir (*)", format_compact_rupiah(comparison["pagu_terblokir"]))
+        metric_columns[3].metric("Realisasi", format_compact_rupiah(comparison["realisasi"]))
+        metric_columns[4].metric("Sisa anggaran", format_compact_rupiah(comparison["sisa"]))
+        st.caption("{} kode RO cocok; {} kode belum memiliki pasangan antarfile.".format(
+            comparison["matched_count"], comparison["unmatched_count"]
+        ))
+    else:
+        pagu_for_card = analysis.get("category_total") if categories else analysis.get("pagu_total")
+        remaining_for_card = analysis.get("category_remaining_total") if categories else analysis.get("remaining_total")
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Total pagu kategori", format_compact_rupiah(pagu_for_card))
+        col2.metric("Sisa anggaran", format_compact_rupiah(remaining_for_card))
+        col3.metric("Kategori dianalisis", len(categories))
+        col4.metric("Rincian bernilai", len(analysis["rows"]))
 
     revision = analysis.get("revision")
     if revision:
@@ -763,7 +1163,10 @@ def render_dashboard(data):
 
     if categories:
         chart_frame = pd.DataFrame(categories)
-        st.markdown("### Pagu terbesar per kategori")
+        st.markdown("### {} terbesar per {}".format(
+            "Pagu efektif" if comparison else "Pagu",
+            "RO" if comparison else "kategori",
+        ))
         pagu_data = chart_frame.nlargest(10, "Pagu").sort_values("Pagu")
         axis_divisor = 1_000_000_000 if pagu_data["Pagu"].max() >= 1_000_000_000 else 1_000_000 if pagu_data["Pagu"].max() >= 1_000_000 else 1
         axis_unit = "miliar" if axis_divisor == 1_000_000_000 else "juta" if axis_divisor == 1_000_000 else "rupiah"
@@ -799,7 +1202,46 @@ def render_dashboard(data):
         )
         st.plotly_chart(fig, use_container_width=True)
 
-        st.markdown("### Porsi pagu")
+        if comparison:
+            compare_columns = [
+                column for column in ("Pagu Penuh", "Pagu Efektif", "Realisasi")
+                if chart_frame[column].notna().any()
+            ]
+            if len(compare_columns) > 1:
+                comparison_data = chart_frame.nlargest(8, "Pagu").copy()
+                comparison_long = comparison_data.melt(
+                    id_vars=["Kategori"],
+                    value_vars=compare_columns,
+                    var_name="Jenis anggaran",
+                    value_name="Nilai",
+                ).dropna(subset=["Nilai"])
+                chart_divisor = 1_000_000_000 if comparison_long["Nilai"].max() >= 1_000_000_000 else 1_000_000
+                chart_unit = "miliar" if chart_divisor == 1_000_000_000 else "juta"
+                comparison_long["Nilai (skala)"] = comparison_long["Nilai"] / chart_divisor
+                comparison_fig = px.bar(
+                    comparison_long,
+                    x="Nilai (skala)",
+                    y="Kategori",
+                    color="Jenis anggaran",
+                    orientation="h",
+                    barmode="group",
+                    color_discrete_sequence=COLORS[:len(compare_columns)],
+                    custom_data=["Nilai"],
+                )
+                comparison_fig.update_traces(
+                    hovertemplate="%{y}<br>%{fullData.name}: Rp %{customdata[0]:,.0f}<extra></extra>"
+                )
+                comparison_fig.update_layout(
+                    height=max(360, 54 * min(len(comparison_data), 8)),
+                    xaxis_title="Nilai (Rp {})".format(chart_unit),
+                    separators=",.",
+                    yaxis_title=None,
+                    margin=dict(l=10, r=25, t=10, b=40),
+                )
+                st.markdown("### Perbandingan pagu dan realisasi per RO")
+                st.plotly_chart(comparison_fig, use_container_width=True)
+
+        st.markdown("### Porsi {} ".format("pagu efektif" if comparison else "pagu"))
         pie_data = chart_frame.nlargest(5, "Pagu").copy()
         pie_data["Label"] = pie_data.apply(
             lambda row: row["Kode"] or row["Kategori"][:24],
@@ -897,18 +1339,30 @@ def infer_activity(analysis):
     return analysis.get("rows", [{}])[0].get("Uraian", "")
 
 
-def build_tor_sections(activity, location, year, notes, analysis):
+def build_tor_sections(activity, location, year, notes, analysis, selected_row=None):
     rows = analysis.get("rows", [])
-    source = next((row for row in rows if row["Uraian"].lower() == activity.lower() and row["Pagu"] is not None), None)
+    source = selected_row or next(
+        (row for row in rows if row["Uraian"].lower() == activity.lower() and row["Pagu"] is not None),
+        None,
+    )
     if source:
-        amount_text = "Pagu: {}{}".format(
-            format_rupiah(source["Pagu"]),
-            " · kode {}".format(source["Kode"]) if source["Kode"] else "",
-        )
-        remaining_text = "Sisa anggaran: {}".format(format_rupiah(source["Sisa anggaran"]))
+        if analysis.get("budget_comparison"):
+            amount_text = "Kode RO: {}. Pagu penuh: {}. Pagu efektif: {}. Pagu terblokir: {}. Realisasi: {}. Sisa anggaran: {}.".format(
+                source["Kode"] or "—",
+                format_rupiah(source.get("Pagu Penuh")),
+                format_rupiah(source.get("Pagu Efektif")),
+                format_rupiah(source.get("Pagu Terblokir")),
+                format_rupiah(source.get("Realisasi")),
+                format_rupiah(source.get("Sisa anggaran")),
+            )
+        else:
+            amount_text = "Pagu: {}{}".format(
+                format_rupiah(source["Pagu"]),
+                " · kode {}".format(source["Kode"]) if source["Kode"] else "",
+            )
+            amount_text += " · Sisa anggaran: {}".format(format_rupiah(source["Sisa anggaran"]))
     else:
         amount_text = "Baris kegiatan belum ditemukan. Cocokkan nama kegiatan dengan RAB sebelum menetapkan pagu."
-        remaining_text = "Sisa anggaran belum dapat dipastikan."
     purpose = notes or "Lengkapi tujuan khusus dan indikator keberhasilan kegiatan."
     return [
         ("I. Latar Belakang", "TOR ini menjadi acuan pelaksanaan {} pada tahun {}, berdasarkan data pada sheet {}.".format(activity, year, analysis.get("sheet", "RAB"))),
@@ -917,47 +1371,104 @@ def build_tor_sections(activity, location, year, notes, analysis):
         ("IV. Ruang Lingkup", "Persiapan, koordinasi, pelaksanaan, pemantauan, dan pelaporan; sesuaikan dengan kebutuhan kegiatan."),
         ("V. Keluaran", "Target keluaran terukur: lengkapi sebelum TOR disahkan."),
         ("VI. Waktu dan Tempat", "Tahun: {} · Lokasi: {}. Lengkapi jadwal pelaksanaan secara rinci.".format(year, location)),
-        ("VII. Pembiayaan", "{} · {}".format(amount_text, remaining_text)),
+        ("VII. Pembiayaan", amount_text),
         ("VIII. Penutup", "Lengkapi bagian sasaran, keluaran, jadwal, dan persetujuan. Verifikasi pembiayaan dengan RAB yang disahkan."),
     ]
 
 
-def make_tor_docx(activity, location, year, sheet_name, sections):
+def make_tor_docx(activity, location, year, sheet_name, sections, ro_code="", budget_data=None):
     document = Document()
     section = document.sections[0]
-    section.top_margin = Inches(0.8)
-    section.bottom_margin = Inches(0.8)
-    heading = document.add_paragraph()
-    heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = heading.add_run("KERANGKA ACUAN KERJA")
-    run.bold = True
-    run.font.size = Pt(16)
-    title = document.add_paragraph()
-    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    title_run = title.add_run(activity)
-    title_run.bold = True
-    title_run.font.size = Pt(15)
-    for label, value in (
-        ("Lokasi", location),
-        ("Tahun anggaran", year),
-        ("Sumber data", sheet_name),
+    section.page_width = Inches(8.27)
+    section.page_height = Inches(11.69)
+    section.top_margin = Inches(0.98)
+    section.bottom_margin = Inches(0.98)
+    section.left_margin = Inches(0.98)
+    section.right_margin = Inches(0.98)
+    normal_style = document.styles["Normal"]
+    normal_style.font.name = "Times New Roman"
+    normal_style.font.size = Pt(11)
+    normal_style.paragraph_format.line_spacing = 1.5
+    normal_style.paragraph_format.space_after = Pt(0)
+
+    def format_paragraph(paragraph, size=11, bold=None, color=None, alignment=None):
+        if alignment is not None:
+            paragraph.alignment = alignment
+        paragraph.paragraph_format.line_spacing = 1.5
+        paragraph.paragraph_format.space_after = Pt(0)
+        for run in paragraph.runs:
+            run.font.name = "Times New Roman"
+            run.font.size = Pt(size)
+            if bold is not None:
+                run.bold = bold
+            if color is not None:
+                run.font.color.rgb = RGBColor.from_string(color)
+
+    cover_title = document.add_paragraph()
+    cover_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    cover_title.paragraph_format.space_before = Pt(18)
+    cover_title.add_run("TOR (TERM OF REFERENCE)")
+    format_paragraph(cover_title, size=14, bold=True, color="092759")
+    for text in (
+        "BALAI MONITOR SPEKTRUM FREKUENSI RADIO KELAS I SURABAYA",
+        "DIREKTORAT JENDERAL INFRASTRUKTUR DIGITAL",
+        "KEMENTERIAN KOMUNIKASI DAN DIGITAL RI",
+        "TAHUN {}".format(year),
     ):
         paragraph = document.add_paragraph()
-        paragraph.add_run(label + ": ").bold = True
-        paragraph.add_run(value)
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        paragraph.add_run(text)
+        format_paragraph(paragraph, size=11, bold=True, color="092759")
+
+    document.add_page_break()
+    heading = document.add_paragraph()
+    heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    heading.add_run("KERANGKA ACUAN KERJA/TERM OF REFERENCE")
+    format_paragraph(heading, size=12, color="092759")
+    output_heading = document.add_paragraph()
+    output_heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    output_heading.add_run("KELUARAN (OUTPUT) TA {}".format(year))
+    format_paragraph(output_heading, size=12, color="092759")
+
+    code_parts = ro_code.split(".") if ro_code else []
+    metadata = [
+        ("Kegiatan", code_parts[0] if code_parts else "Sesuai RAB"),
+        ("Klasifikasi Rincian Output", ".".join(code_parts[:2]) if len(code_parts) >= 2 else "—"),
+        ("Rincian Output (RO)", "{} — {}".format(ro_code, activity) if ro_code else activity),
+        ("Tahun Anggaran", year),
+        ("Lokasi", location),
+        ("Sumber Data", sheet_name),
+    ]
+    if budget_data:
+        metadata.extend([
+            ("Pagu Penuh", format_rupiah(budget_data.get("Pagu Penuh"))),
+            ("Pagu Efektif", format_rupiah(budget_data.get("Pagu Efektif"))),
+            ("Pagu Terblokir (*)", format_rupiah(budget_data.get("Pagu Terblokir"))),
+            ("Realisasi", format_rupiah(budget_data.get("Realisasi"))),
+            ("Sisa Anggaran", format_rupiah(budget_data.get("Sisa anggaran"))),
+        ])
+    table = document.add_table(rows=0, cols=2)
+    table.style = "Table Grid"
+    for label, value in metadata:
+        cells = table.add_row().cells
+        cells[0].text = label
+        cells[1].text = value
+        for paragraph in cells[0].paragraphs:
+            format_paragraph(paragraph, bold=True, color="092759")
+        for paragraph in cells[1].paragraphs:
+            format_paragraph(paragraph, alignment=WD_ALIGN_PARAGRAPH.JUSTIFY)
+
     for title_text, body in sections:
         heading = document.add_heading(title_text, level=1)
-        for run in heading.runs:
-            run.font.color.rgb = RGBColor(18, 61, 112)
-            run.font.name = "Arial"
+        heading.paragraph_format.space_before = Pt(3.05)
+        heading.paragraph_format.space_after = Pt(0)
+        format_paragraph(heading, size=12, bold=True, color="092759", alignment=WD_ALIGN_PARAGRAPH.JUSTIFY)
         paragraph = document.add_paragraph(body)
-        paragraph.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-        for run in paragraph.runs:
-            run.font.name = "Arial"
-            run.font.size = Pt(11)
+        format_paragraph(paragraph, alignment=WD_ALIGN_PARAGRAPH.JUSTIFY)
     end = document.add_paragraph()
     end.alignment = WD_ALIGN_PARAGRAPH.RIGHT
     end.add_run("Draft untuk ditinjau dan dilengkapi\n\n\nPenanggung Jawab Kegiatan").italic = True
+    format_paragraph(end, alignment=WD_ALIGN_PARAGRAPH.RIGHT)
     output = io.BytesIO()
     document.save(output)
     return output.getvalue()
@@ -969,22 +1480,52 @@ def render_tor(data):
         st.info("Unggah RAB pada tab Dashboard untuk menghubungkan data dan membuat draft TOR.")
         return
     sheet, analysis = data
-    default_activity = infer_activity(analysis)
-    activity = st.text_input("Nama kegiatan", value=default_activity, key="tor_activity")
+    selected_row = None
+    if analysis.get("budget_comparison"):
+        ro_rows = [row for row in analysis["rows"] if row["Kode"]]
+        if ro_rows:
+            row_by_code = {row["Kode"]: row for row in ro_rows}
+            selected_code = st.selectbox(
+                "Pilih kode Rincian Output (RO)",
+                list(row_by_code),
+                key="tor_ro_code",
+                format_func=lambda code: "{} — {}".format(code, row_by_code[code]["Uraian"]),
+            )
+            selected_row = row_by_code[selected_code]
+            if st.session_state.get("_tor_activity_ro") != selected_code:
+                st.session_state["tor_activity"] = selected_row["Uraian"]
+                st.session_state["_tor_activity_ro"] = selected_code
+        else:
+            st.warning("Belum ada baris RO yang dapat digunakan untuk membuat TOR.")
+    default_activity = selected_row["Uraian"] if selected_row else infer_activity(analysis)
+    if "tor_activity" not in st.session_state:
+        st.session_state["tor_activity"] = default_activity
+    activity = st.text_input("Nama kegiatan", key="tor_activity")
     location = st.text_input("Lokasi pelaksanaan", value="", key="tor_location")
     year = st.text_input("Tahun pelaksanaan", value="2026", key="tor_year")
     notes = st.text_area("Tujuan / catatan khusus", key="tor_notes")
-    st.caption("Sumber data: {} · {} baris bernilai.".format(sheet, len(analysis["rows"])))
+    st.caption("Sumber data: {} · {} baris bernilai. Draft menggunakan format A4, Times New Roman 11, spasi 1,5, dan paragraf rata kiri-kanan.".format(
+        sheet, len(analysis["rows"])
+    ))
     if st.button("Buat draft TOR", type="primary"):
         if not activity.strip():
             st.error("Nama kegiatan perlu diisi.")
         else:
-            sections = build_tor_sections(activity.strip(), location.strip() or "Lokasi pelaksanaan ditetapkan kemudian", year.strip() or "2026", notes.strip(), analysis)
+            sections = build_tor_sections(
+                activity.strip(),
+                location.strip() or "Lokasi pelaksanaan ditetapkan kemudian",
+                year.strip() or "2026",
+                notes.strip(),
+                analysis,
+                selected_row=selected_row,
+            )
             st.session_state.tor_result = {
                 "activity": activity.strip(),
                 "location": location.strip() or "Lokasi pelaksanaan ditetapkan kemudian",
                 "year": year.strip() or "2026",
                 "sections": sections,
+                "ro_code": selected_row["Kode"] if selected_row else "",
+                "budget_data": selected_row,
             }
     result = st.session_state.get("tor_result")
     if result:
@@ -999,8 +1540,18 @@ def render_tor(data):
             for section_title, body in result["sections"]:
                 st.markdown("**{}**".format(section_title))
                 st.write(body)
-        document = make_tor_docx(result["activity"], result["location"], result["year"], sheet, result["sections"])
+        document = make_tor_docx(
+            result["activity"],
+            result["location"],
+            result["year"],
+            sheet,
+            result["sections"],
+            ro_code=result.get("ro_code", ""),
+            budget_data=result.get("budget_data"),
+        )
         safe_name = re.sub(r"[^a-z0-9]+", "-", result["activity"].lower()).strip("-") or "draft"
+        if result.get("ro_code"):
+            safe_name += "-" + re.sub(r"[^a-z0-9]+", "-", result["ro_code"].lower()).strip("-")
         st.download_button(
             "Unduh TOR dalam Word",
             data=document,
