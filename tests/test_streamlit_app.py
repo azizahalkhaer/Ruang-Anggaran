@@ -16,7 +16,7 @@ class StreamlitAppTests(unittest.TestCase):
         self.assertIsNone(streamlit_app.to_number("—"))
 
     def test_compact_rupiah_uses_short_indonesian_units(self):
-        self.assertEqual(streamlit_app.format_compact_rupiah(1_700_000_000), "1,7 m")
+        self.assertEqual(streamlit_app.format_compact_rupiah(17_100_000_000), "17,1 M")
         self.assertEqual(streamlit_app.format_compact_rupiah(1_260_000), "1,3 jt")
 
     def test_account_can_log_in_after_a_new_database_connection(self):

@@ -442,7 +442,7 @@ def format_compact_rupiah(value):
         return "—"
     amount = abs(value)
     if amount >= 1_000_000_000:
-        scaled, suffix = value / 1_000_000_000, " m"
+        scaled, suffix = value / 1_000_000_000, " M"
     elif amount >= 1_000_000:
         scaled, suffix = value / 1_000_000, " jt"
     elif amount >= 1_000:
@@ -657,8 +657,8 @@ def render_dashboard(data):
     pagu_for_card = analysis.get("category_total") if categories else analysis.get("pagu_total")
     remaining_for_card = analysis.get("category_remaining_total") if categories else analysis.get("remaining_total")
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Total pagu kategori", format_rupiah(pagu_for_card))
-    col2.metric("Sisa anggaran", format_rupiah(remaining_for_card))
+    col1.metric("Total pagu kategori", format_compact_rupiah(pagu_for_card))
+    col2.metric("Sisa anggaran", format_compact_rupiah(remaining_for_card))
     col3.metric("Kategori dianalisis", len(categories))
     col4.metric("Rincian bernilai", len(analysis["rows"]))
 
@@ -674,10 +674,10 @@ def render_dashboard(data):
         else:
             st.info("Tidak ada kenaikan pagu yang terdeteksi.")
         rev1, rev2, rev3, rev4 = st.columns(4)
-        rev1.metric("Total kenaikan", format_rupiah(revision["increase_total"]))
+        rev1.metric("Total kenaikan", format_compact_rupiah(revision["increase_total"]))
         rev2.metric("Sisa mencukupi", revision["sufficient_count"])
         rev3.metric("Sisa lebih kecil", revision["insufficient_count"])
-        rev4.metric("Kekurangan terhitung", format_rupiah(revision["shortfall"]))
+        rev4.metric("Kekurangan terhitung", format_compact_rupiah(revision["shortfall"]))
         if revision["changes"]:
             revision_frame = pd.DataFrame(revision["changes"]).drop(columns=["_status"])
             st.dataframe(revision_frame, use_container_width=True, hide_index=True)
@@ -688,7 +688,7 @@ def render_dashboard(data):
         pagu_data = chart_frame.nlargest(10, "Pagu").sort_values("Pagu")
         axis_divisor = 1_000_000_000 if pagu_data["Pagu"].max() >= 1_000_000_000 else 1_000_000 if pagu_data["Pagu"].max() >= 1_000_000 else 1
         axis_unit = "miliar" if axis_divisor == 1_000_000_000 else "juta" if axis_divisor == 1_000_000 else "rupiah"
-        axis_suffix = " m" if axis_divisor == 1_000_000_000 else " jt" if axis_divisor == 1_000_000 else ""
+        axis_suffix = " M" if axis_divisor == 1_000_000_000 else " jt" if axis_divisor == 1_000_000 else ""
         pagu_data = pagu_data.assign(
             **{
                 "Pagu (skala)": pagu_data["Pagu"] / axis_divisor,
@@ -762,7 +762,7 @@ def render_dashboard(data):
             remaining = remaining.sort_values("Sisa")
             remaining_divisor = 1_000_000_000 if remaining["Sisa"].max() >= 1_000_000_000 else 1_000_000 if remaining["Sisa"].max() >= 1_000_000 else 1
             remaining_unit = "miliar" if remaining_divisor == 1_000_000_000 else "juta" if remaining_divisor == 1_000_000 else "rupiah"
-            remaining_suffix = " m" if remaining_divisor == 1_000_000_000 else " jt" if remaining_divisor == 1_000_000 else ""
+            remaining_suffix = " M" if remaining_divisor == 1_000_000_000 else " jt" if remaining_divisor == 1_000_000 else ""
             remaining = remaining.assign(
                 **{
                     "Sisa (skala)": remaining["Sisa"] / remaining_divisor,
