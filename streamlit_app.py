@@ -3,6 +3,8 @@ import hmac
 import io
 import re
 import secrets
+import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 
 import pandas as pd
@@ -23,7 +25,7 @@ IDENTITY_COMPONENT = components.declare_component(
 )
 COLORS = ["#092759", "#087cb5", "#3d91b8", "#7a9bb5", "#a8bbc9", "#c3ccd4"]
 MAX_UPLOAD_SIZE = 20 * 1024 * 1024
-ACCOUNT_KEY = "streamlit_demo_accounts"
+ACCOUNT_DB_PATH = ROOT / ".data" / "accounts.sqlite3"
 
 
 def clean_text(value):
@@ -435,6 +437,24 @@ def format_rupiah(value):
     return "Rp {:,.0f}".format(value).replace(",", ".")
 
 
+def format_compact_rupiah(value):
+    if value is None:
+        return "—"
+    amount = abs(value)
+    if amount >= 1_000_000_000:
+        scaled, suffix = value / 1_000_000_000, " m"
+    elif amount >= 1_000_000:
+        scaled, suffix = value / 1_000_000, " jt"
+    elif amount >= 1_000:
+        scaled, suffix = value / 1_000, " rb"
+    else:
+        return "Rp {:,.0f}".format(value).replace(",", ".")
+    number = "{:,.1f}".format(scaled).replace(",", "X").replace(".", ",").replace("X", ".")
+    if number.endswith(",0"):
+        number = number[:-2]
+    return number + suffix
+
+
 def hash_password(password, salt=None):
     salt = salt or secrets.token_bytes(16)
     digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 180000)
@@ -444,6 +464,49 @@ def hash_password(password, salt=None):
 def password_matches(password, salt_hex, digest_hex):
     _, candidate = hash_password(password, bytes.fromhex(salt_hex))
     return hmac.compare_digest(candidate, digest_hex)
+
+
+@contextmanager
+def account_connection():
+    ACCOUNT_DB_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    ACCOUNT_DB_PATH.parent.chmod(0o700)
+    connection = sqlite3.connect(ACCOUNT_DB_PATH, timeout=10)
+    try:
+        with connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS accounts (
+                    email TEXT PRIMARY KEY,
+                    salt TEXT NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            yield connection
+    finally:
+        connection.close()
+        ACCOUNT_DB_PATH.chmod(0o600)
+
+
+def get_account(email):
+    with account_connection() as connection:
+        row = connection.execute(
+            "SELECT salt, password_hash FROM accounts WHERE email = ?",
+            (email,),
+        ).fetchone()
+    if row is None:
+        return None
+    return {"salt": row[0], "digest": row[1]}
+
+
+def create_account(email, salt, digest):
+    with account_connection() as connection:
+        cursor = connection.execute(
+            "INSERT OR IGNORE INTO accounts (email, salt, password_hash) VALUES (?, ?, ?)",
+            (email, salt, digest),
+        )
+        return cursor.rowcount == 1
 
 
 def logout():
@@ -496,12 +559,13 @@ def render_auth():
                         password = st.text_input("Kata sandi", type="password", key="login_password")
                         submitted = st.form_submit_button("Masuk", type="primary", use_container_width=True)
                     if submitted:
-                        account = st.session_state.get(ACCOUNT_KEY, {}).get(email.strip().lower())
+                        normalized_email = email.strip().lower()
+                        account = get_account(normalized_email)
                         if account and password_matches(password, account["salt"], account["digest"]):
-                            st.session_state.authenticated_email = email.strip().lower()
+                            st.session_state.authenticated_email = normalized_email
                             st.rerun()
                         else:
-                            st.error("Email atau kata sandi tidak cocok pada sesi demo ini.")
+                            st.error("Email atau kata sandi tidak cocok.")
                 else:
                     with st.form("signup_form"):
                         email = st.text_input("Email", key="signup_email", autocomplete="email")
@@ -513,8 +577,8 @@ def render_auth():
                             st.error("Nomor pegawai harus berisi sedikitnya 5 angka.")
                         elif "@" not in email or len(password) < 8:
                             st.error("Masukkan email yang valid dan kata sandi minimal 8 karakter.")
-                        elif email.strip().lower() in st.session_state.get(ACCOUNT_KEY, {}):
-                            st.error("Email sudah terdaftar pada sesi demo ini.")
+                        elif get_account(email.strip().lower()):
+                            st.error("Email sudah terdaftar.")
                         else:
                             salt, digest = hash_password(password)
                             st.session_state.pending_signup = {
@@ -533,12 +597,14 @@ def render_auth():
                             height=430,
                         )
                         if isinstance(result, dict) and result.get("verified"):
-                            accounts = st.session_state.setdefault(ACCOUNT_KEY, {})
-                            accounts[pending["email"]] = {"salt": pending["salt"], "digest": pending["digest"]}
-                            st.session_state.authenticated_email = pending["email"]
-                            st.session_state.pop("pending_signup", None)
-                            st.success("Pemeriksaan awal cocok. Akun demo dibuat.")
-                            st.rerun()
+                            if create_account(pending["email"], pending["salt"], pending["digest"]):
+                                st.session_state.authenticated_email = pending["email"]
+                                st.session_state.pop("pending_signup", None)
+                                st.success("Pemeriksaan awal cocok. Akun demo dibuat.")
+                                st.rerun()
+                            else:
+                                st.session_state.pop("pending_signup", None)
+                                st.error("Email sudah terdaftar. Silakan masuk dengan akun tersebut.")
                         elif isinstance(result, dict) and result.get("message"):
                             st.error(result["message"])
 
@@ -622,18 +688,23 @@ def render_dashboard(data):
         pagu_data = chart_frame.nlargest(10, "Pagu").sort_values("Pagu")
         axis_divisor = 1_000_000_000 if pagu_data["Pagu"].max() >= 1_000_000_000 else 1_000_000 if pagu_data["Pagu"].max() >= 1_000_000 else 1
         axis_unit = "miliar" if axis_divisor == 1_000_000_000 else "juta" if axis_divisor == 1_000_000 else "rupiah"
-        pagu_data = pagu_data.assign(**{"Pagu (skala)": pagu_data["Pagu"] / axis_divisor})
+        axis_suffix = " m" if axis_divisor == 1_000_000_000 else " jt" if axis_divisor == 1_000_000 else ""
+        pagu_data = pagu_data.assign(
+            **{
+                "Pagu (skala)": pagu_data["Pagu"] / axis_divisor,
+                "Label ringkas": pagu_data["Pagu"].map(format_compact_rupiah),
+            }
+        )
         fig = px.bar(
             pagu_data,
             x="Pagu (skala)",
             y="Kategori",
             orientation="h",
-            text="Pagu (skala)",
+            text="Label ringkas",
             color_discrete_sequence=[COLORS[0]],
             custom_data=["Pagu"],
         )
         fig.update_traces(
-            texttemplate="%{x:,.2f}",
             textposition="outside",
             cliponaxis=False,
             hovertemplate="%{y}<br>Pagu: Rp %{customdata[0]:,.0f}<extra></extra>",
@@ -641,6 +712,8 @@ def render_dashboard(data):
         fig.update_layout(
             height=max(330, 48 * len(pagu_data)),
             xaxis_title="Pagu (Rp {})".format(axis_unit),
+            separators=",.",
+            xaxis=dict(ticksuffix=axis_suffix),
             yaxis_title=None,
             showlegend=False,
             margin=dict(l=10, r=55, t=10, b=40),
@@ -689,18 +762,23 @@ def render_dashboard(data):
             remaining = remaining.sort_values("Sisa")
             remaining_divisor = 1_000_000_000 if remaining["Sisa"].max() >= 1_000_000_000 else 1_000_000 if remaining["Sisa"].max() >= 1_000_000 else 1
             remaining_unit = "miliar" if remaining_divisor == 1_000_000_000 else "juta" if remaining_divisor == 1_000_000 else "rupiah"
-            remaining = remaining.assign(**{"Sisa (skala)": remaining["Sisa"] / remaining_divisor})
+            remaining_suffix = " m" if remaining_divisor == 1_000_000_000 else " jt" if remaining_divisor == 1_000_000 else ""
+            remaining = remaining.assign(
+                **{
+                    "Sisa (skala)": remaining["Sisa"] / remaining_divisor,
+                    "Label ringkas": remaining["Sisa"].map(format_compact_rupiah),
+                }
+            )
             bar = px.bar(
                 remaining,
                 x="Sisa (skala)",
                 y="Kategori",
                 orientation="h",
-                text="Sisa (skala)",
+                text="Label ringkas",
                 color_discrete_sequence=[COLORS[1]],
                 custom_data=["Sisa"],
             )
             bar.update_traces(
-                texttemplate="%{x:,.1f}",
                 textposition="outside",
                 cliponaxis=False,
                 hovertemplate="%{y}<br>Sisa: Rp %{customdata[0]:,.0f}<extra></extra>",
@@ -708,6 +786,8 @@ def render_dashboard(data):
             bar.update_layout(
                 height=max(280, min(440, 48 * len(remaining))),
                 xaxis_title="Sisa (Rp {})".format(remaining_unit),
+                separators=",.",
+                xaxis=dict(ticksuffix=remaining_suffix),
                 yaxis_title=None,
                 showlegend=False,
                 margin=dict(l=10, r=45, t=10, b=40),

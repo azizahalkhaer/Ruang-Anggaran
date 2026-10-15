@@ -1,0 +1,12 @@
+.venv/
+node_modules/
+__pycache__/
+*.py[cod]
+.data/
+*.sqlite3
+.env
+.streamlit/secrets.toml
+
+/RAB_REVISI_*.xlsx
+/Laporan Fa Detail*.pdf
+/TOR-*.rtf

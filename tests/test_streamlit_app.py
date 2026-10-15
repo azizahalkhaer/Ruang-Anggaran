@@ -1,5 +1,8 @@
 import io
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 from docx import Document
 
@@ -11,6 +14,23 @@ class StreamlitAppTests(unittest.TestCase):
         self.assertEqual(streamlit_app.to_number("Rp 1.234.567"), 1234567)
         self.assertEqual(streamlit_app.to_number("1234,5"), 1234.5)
         self.assertIsNone(streamlit_app.to_number("—"))
+
+    def test_compact_rupiah_uses_short_indonesian_units(self):
+        self.assertEqual(streamlit_app.format_compact_rupiah(1_700_000_000), "1,7 m")
+        self.assertEqual(streamlit_app.format_compact_rupiah(1_260_000), "1,3 jt")
+
+    def test_account_can_log_in_after_a_new_database_connection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / ".data" / "accounts.sqlite3"
+            with patch.object(streamlit_app, "ACCOUNT_DB_PATH", database_path):
+                salt, digest = streamlit_app.hash_password("password123")
+                self.assertTrue(streamlit_app.create_account("staff@example.com", salt, digest))
+
+                account = streamlit_app.get_account("staff@example.com")
+                self.assertIsNotNone(account)
+                self.assertTrue(streamlit_app.password_matches("password123", account["salt"], account["digest"]))
+                self.assertFalse(streamlit_app.password_matches("wrong-password", account["salt"], account["digest"]))
+                self.assertFalse(streamlit_app.create_account("staff@example.com", salt, digest))
 
     def test_revision_compares_remaining_to_increase(self):
         rows = [
