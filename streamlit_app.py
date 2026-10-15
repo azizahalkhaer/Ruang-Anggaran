@@ -6,6 +6,7 @@ import os
 import re
 import secrets
 import sqlite3
+import socket
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -22,6 +23,7 @@ ROOT = Path(__file__).resolve().parent
 COLORS = ["#092759", "#087cb5", "#3d91b8", "#7a9bb5", "#a8bbc9", "#c3ccd4"]
 MAX_UPLOAD_SIZE = 20 * 1024 * 1024
 ACCOUNT_DB_PATH = ROOT / ".data" / "accounts.sqlite3"
+OFFICE_SIGNUP_CIDRS = "192.168.100.0/24"
 BUDGET_HEADERS = [
     "_Jenis",
     "Kode Anggaran",
@@ -928,14 +930,35 @@ def signup_network_status(client_ip, allowed_cidrs):
 
 
 def get_signup_network_status():
-    allowed_cidrs = os.environ.get("SIGNUP_ALLOWED_CIDRS", "")
+    allowed_cidrs = os.environ.get("SIGNUP_ALLOWED_CIDRS", OFFICE_SIGNUP_CIDRS)
     if not allowed_cidrs:
         try:
             allowed_cidrs = st.secrets.get("SIGNUP_ALLOWED_CIDRS", "")
         except StreamlitSecretNotFoundError:
             allowed_cidrs = ""
-    forwarded_for = st.context.headers.get("X-Forwarded-For", "")
-    client_ip = forwarded_for.split(",", 1)[0].strip()
+    client_ip = getattr(st.context, "ip_address", None)
+    if not client_ip:
+        try:
+            networks = [
+                ipaddress.ip_network(value.strip(), strict=False)
+                for value in allowed_cidrs.split(",")
+                if value.strip()
+            ]
+        except ValueError:
+            networks = []
+        for network in networks:
+            probe_ip = network.network_address
+            if network.num_addresses > 2:
+                probe_ip += 1
+            try:
+                with socket.socket(socket.AF_INET if probe_ip.version == 4 else socket.AF_INET6, socket.SOCK_DGRAM) as probe:
+                    probe.connect((str(probe_ip), 9))
+                    local_ip = probe.getsockname()[0]
+                if local_ip:
+                    client_ip = local_ip
+                    break
+            except OSError:
+                continue
     return signup_network_status(client_ip, allowed_cidrs)
 
 
